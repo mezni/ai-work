@@ -1,0 +1,93 @@
+use std::time::Instant;
+
+use axum::extract::rejection::JsonRejection;
+use axum::{Json, extract::State};
+
+use crate::{
+    api::{
+        dto::{
+            AssistantMessageDto, ChatCompletionChoiceDto, ChatCompletionRequestDto,
+            ChatCompletionResponseDto,
+        },
+        error::ApiError,
+        telemetry::emit_chat_signal,
+    },
+    application::{
+        AppState,
+        chat::{ChatValidator, CompleteChatCommand, IncomingMessage, call_provider_bounded},
+    },
+};
+
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    payload: Result<Json<ChatCompletionRequestDto>, JsonRejection>,
+) -> Result<Json<ChatCompletionResponseDto>, ApiError> {
+    let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    let ChatCompletionRequestDto {
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        stream,
+    } = request;
+
+    let command = CompleteChatCommand {
+        model,
+        messages: messages
+            .into_iter()
+            .map(|message| IncomingMessage {
+                role: message.role,
+                content: message.content,
+            })
+            .collect(),
+        temperature,
+        max_tokens,
+        stream,
+    };
+
+    // Validation first: a request that breaks a rule is rejected without any
+    // provider being contacted, so an invalid request can never surface as a
+    // provider failure.
+    let validated = ChatValidator::validate(command).map_err(ApiError::from_validation_error)?;
+
+    let model = validated.model().to_owned();
+    let started = Instant::now();
+    let result = call_provider_bounded(
+        state.chat_service.as_ref(),
+        validated.request(),
+        state.provider_config.deadline_ms,
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let response = match result {
+        Ok(response) => {
+            let signal = state
+                .telemetry
+                .record_chat(state.provider_id(), &model, latency_ms, true, None);
+            emit_chat_signal(&signal);
+            response
+        }
+        Err(failure) => {
+            let signal = state
+                .telemetry
+                .record_chat(state.provider_id(), &model, latency_ms, false, Some(failure));
+            emit_chat_signal(&signal);
+            return Err(ApiError::from_provider_failure(failure));
+        }
+    };
+
+    Ok(Json(ChatCompletionResponseDto {
+        id: "chat_mock".to_owned(),
+        object: "chat.completion".to_owned(),
+        model,
+        choices: vec![ChatCompletionChoiceDto {
+            index: 0,
+            message: AssistantMessageDto {
+                role: "assistant".to_owned(),
+                content: response.content,
+            },
+            finish_reason: "stop".to_owned(),
+        }],
+    }))
+}
